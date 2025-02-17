@@ -3,13 +3,6 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from dataclasses import dataclass
 from typing import List, Callable
 from torch import Tensor, torch
-from enum import Enum
-
-
-class ActivationMode(Enum):
-    ORIGINAL = 1
-    CAPTURE = 2
-    STEER = 3
 
 
 @dataclass
@@ -24,7 +17,6 @@ class SteerElement:
 
 @dataclass
 class SteerData:
-    orig_forward_fn: torch.nn.Module.forward
     layer_idx: int
     steer_vectors: List[SteerElement]
 
@@ -33,62 +25,28 @@ class Steer:
     steers = {}
 
     def __init__(
-        self,
-        model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizerBase,
-        copyModel: bool = False,
+            self,
+            model: PreTrainedModel,
+            tokenizer: PreTrainedTokenizerBase,
+            copyModel: bool = False,
     ):
         self.model = deepcopy(model) if copyModel else model
         self.tokenizer = tokenizer
         self.device = torch.device(next(model.parameters()).device)
+        self.hooks = {}
 
-    def _set_forward_fn(self, option: ActivationMode, layer_idx: int):
-        if option == ActivationMode.ORIGINAL:
-            steer = self.steers.pop(layer_idx, None)
-            if steer is not None:
-                self.model._modules["model"].layers[
-                    layer_idx
-                ].forward = steer.orig_forward_fn
-        elif option == ActivationMode.CAPTURE:
-            self.steers.setdefault(
-                layer_idx,
-                SteerData(
-                    orig_forward_fn=self.model._modules["model"]
-                    .layers[layer_idx]
-                    .forward,
-                    layer_idx=layer_idx,
-                    steer_vectors=[],
-                ),
-            )
-            self.model._modules["model"].layers[
-                layer_idx
-            ].forward = self._store_activations_forward(layer_idx)
-        elif option == ActivationMode.STEER:
-            self.steers.setdefault(
-                layer_idx,
-                SteerData(
-                    orig_forward_fn=self.model._modules["model"]
-                    .layers[layer_idx]
-                    .forward,
-                    layer_idx=layer_idx,
-                    steer_vectors=[],
-                ),
-            )
-            self.model._modules["model"].layers[
-                layer_idx
-            ].forward = self._steer_vector_forward(layer_idx)
-
-    def _store_activations_forward(self, layer_idx: int):
-        def _store_activations_forward_inner(*args, **kwargds):
+    def register_capture_hook(self, layer_idx: int):
+        def capture_hook(module, args, kwargs, output):
             self.captured_tensor = (
-                kwargds["hidden_states"] if "hidden_states" in kwargds else args[0]
+                kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
             )
-            return self.steers[layer_idx].orig_forward_fn(*args, **kwargds)
+            return output
 
-        return _store_activations_forward_inner
+        handle = self.model._modules["model"].layers[layer_idx].register_forward_hook(capture_hook, with_kwargs=True)
+        self.hooks[layer_idx] = handle
 
-    def _steer_vector_forward(self, layer_idx: int):
-        def _steer_vector_forward_inner(*args, **kwargds):
+    def register_steer_hook(self, layer_idx: int):
+        def steer_hook(module, args, kwargs):
             for elem in self.steers[layer_idx].steer_vectors:
                 if elem.tensor.size()[1] <= elem.try_keep_nr:
                     extraText = ""
@@ -105,60 +63,70 @@ class Steer:
                     delta = elem.steering_method(elem.tensor, elem.coeff, elem.try_keep_nr)
                 else:
                     delta = torch.mean(
-                        elem.coeff * elem.tensor[:, elem.try_keep_nr :, :],
+                        elem.coeff * elem.tensor[:, elem.try_keep_nr:, :],
                         dim=1,
                         keepdim=True,
                     )
 
-                if "hidden_states" in kwargds:
-                    if kwargds["hidden_states"].size()[1] == 1:
-                        kwargds["hidden_states"][:, -1:, :] += delta
+                if "hidden_states" in kwargs:
+                    if kwargs["hidden_states"].size()[1] == 1:
+                        kwargs["hidden_states"][:, -1:, :] += delta
                     else:
-                        kwargds["hidden_states"][:, elem.try_keep_nr :, :] += delta
+                        kwargs["hidden_states"][:, elem.try_keep_nr:, :] += delta
                 elif isinstance(args[0], Tensor):
                     if args[0].size()[1] == 1:
                         args[0][:, -1:, :] += delta
                     else:
-                        args[0][:, elem.try_keep_nr :, :] += delta
+                        args[0][:, elem.try_keep_nr:, :] += delta
                 else:
                     raise Exception(
                         "The model is not currently supported. Please open an issue in the official GitHub repository."
                     )
 
-            return self.steers[layer_idx].orig_forward_fn(*args, **kwargds)
+            return args, kwargs
 
-        return _steer_vector_forward_inner
+        handle = self.model._modules["model"].layers[layer_idx].register_forward_pre_hook(steer_hook, with_kwargs=True)
+        self.hooks[layer_idx] = handle
+
+    def remove_hook(self, layer_idx: int):
+        if layer_idx in self.hooks:
+            self.hooks[layer_idx].remove()
+            del self.hooks[layer_idx]
 
     def get_all(self):
         """
         Get all the steering vectors data that are applied on the model.
         Can be used for replicating in the future the state.
         """
-        return [{'layer_idx': val.layer_idx, 'text': x.text, 'coeff': x.coeff, 'try_keep_nr': x.try_keep_nr, 'exclude_bos_token': x.exclude_bos_token} for val in self.steers.values() for x in val.steer_vectors]
+        return [{'layer_idx': val.layer_idx, 'text': x.text, 'coeff': x.coeff, 'try_keep_nr': x.try_keep_nr,
+                 'exclude_bos_token': x.exclude_bos_token} for val in self.steers.values() for x in val.steer_vectors]
 
     def reset(self, layer_idx: int):
         """
-        Remove the steering vectors on a particular layer.      
+        Remove the steering vectors on a particular layer.
         Args:
             layer_idx (int): The layer index that will have the steering vectors removed.
         """
-        self._set_forward_fn(ActivationMode.ORIGINAL, layer_idx)
+        self.remove_hook(layer_idx)
+        if layer_idx in self.steers:
+            del self.steers[layer_idx]
 
     def reset_all(self):
         """
         Remove all steering vectors that were applied on the model.
-        Gets the model to initial state, before wrapping it in the Steer class and using add(). 
+        Gets the model to initial state, before wrapping it in the Steer class and using add().
         """
-        [self.reset(idx) for idx in range(len(self.model._modules["model"].layers))]
+        for layer_idx in list(self.hooks.keys()):
+            self.reset(layer_idx)
 
     def add(
-        self,
-        layer_idx: int,
-        coeff: float,
-        text: str,
-        try_keep_nr: int = None,
-        exclude_bos_token: bool = False,
-        steering_method: Callable = None,
+            self,
+            layer_idx: int,
+            coeff: float,
+            text: str,
+            try_keep_nr: int = None,
+            exclude_bos_token: bool = False,
+            steering_method: Callable = None,
     ):
         """
         Add a steering vector.
@@ -178,22 +146,23 @@ class Steer:
         ), f"""Current model has {len(self.model._modules['model'].layers)} layers, 
         but the provided layer_idx is not within 
         [0, {len(self.model._modules['model'].layers) - 1}] interval."""
-        
+
         text_tokens = self.tokenizer.encode(text)
 
-        #inject bos_token
-        #This can be reverted with exclude_bos_token=True
-        if self.tokenizer.bos_token is not None and text_tokens[0] != self.tokenizer.encode(self.tokenizer.bos_token)[-1]:
+        # inject bos_token
+        # This can be reverted with exclude_bos_token=True
+        if self.tokenizer.bos_token is not None and text_tokens[0] != self.tokenizer.encode(self.tokenizer.bos_token)[
+            -1]:
             text_tokens.insert(0, self.tokenizer.encode(self.tokenizer.bos_token)[-1])
-        
+
         if (
-            exclude_bos_token
-            and self.tokenizer.bos_token is not None
+                exclude_bos_token
+                and self.tokenizer.bos_token is not None
         ):
             text_tokens = text_tokens[1:]
-            
+
         print(f"text tokens: {text_tokens}")
-        
+
         layer_tensor = self._capture_tensor(
             layer_idx, torch.tensor(text_tokens).to(self.device).unsqueeze(0)
         )
@@ -217,18 +186,19 @@ class Steer:
         steer = self.steers.setdefault(
             layer_idx,
             SteerData(
-                orig_forward_fn=self.model._modules["model"].layers[layer_idx].forward,
                 layer_idx=layer_idx,
                 steer_vectors=[],
             ),
         )
         steer.steer_vectors.append(steerElem)
-        self._set_forward_fn(ActivationMode.STEER, layer_idx)
+        self.register_steer_hook(layer_idx)
 
     def _capture_tensor(self, layer_idx: int, tokens: Tensor):
-        self._set_forward_fn(ActivationMode.CAPTURE, layer_idx)
+        self.register_capture_hook(layer_idx)
         with torch.inference_mode():
             self.model(tokens)
+        self.remove_hook(layer_idx)
+
         result = self.captured_tensor
         print(f"captured tensor: {result}")
         return result
